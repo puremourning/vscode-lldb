@@ -1033,27 +1033,19 @@ impl DebugSession {
             if let Some(child) = child {
                 let addr = child.load_address();
                 if addr != lldb::INVALID_ADDRESS {
-                    let size = child.byte_size();
-                    if self.is_valid_watchpoint_size(size) {
-                        let data_id = format!("{}/{}", addr, size);
-                        let desc = child.name().unwrap_or("");
-                        Ok(DataBreakpointInfoResponseBody {
-                            data_id: Some(data_id),
-                            access_types: Some(vec![
-                                DataBreakpointAccessType::Read,
-                                DataBreakpointAccessType::Write,
-                                DataBreakpointAccessType::ReadWrite,
-                            ]),
-                            description: format!("{} bytes at {:X} ({})", size, addr, desc),
-                            ..Default::default()
-                        })
-                    } else {
-                        Ok(DataBreakpointInfoResponseBody {
-                            data_id: None,
-                            description: "Invalid watchpoint size.".into(),
-                            ..Default::default()
-                        })
-                    }
+                    let size = args.bytes.unwrap_or( child.byte_size() as i64 ) as usize;
+                    let data_id = format!("{}/{}", addr, size);
+                    let desc = child.name().unwrap_or("");
+                    Ok(DataBreakpointInfoResponseBody {
+                        data_id: Some(data_id),
+                        access_types: Some(vec![
+                            DataBreakpointAccessType::Read,
+                            DataBreakpointAccessType::Write,
+                            DataBreakpointAccessType::ReadWrite,
+                        ]),
+                        description: format!("{} bytes at {:X} ({})", size, addr, desc),
+                        ..Default::default()
+                    })
                 } else {
                     Ok(DataBreakpointInfoResponseBody {
                         data_id: None,
@@ -1099,12 +1091,6 @@ impl DebugSession {
                         description: format!("Invalid address {}", addr),
                         ..Default::default()
                     })
-                } else if self.is_valid_watchpoint_size(size) {
-                    Ok(DataBreakpointInfoResponseBody {
-                        data_id: None,
-                        description: format!("Invalid size {} for watchpoint", size),
-                        ..Default::default()
-                    })
                 } else {
                     Ok(DataBreakpointInfoResponseBody {
                         data_id: Some(format!("{}/{}", addr, size)),
@@ -1124,26 +1110,18 @@ impl DebugSession {
                 let addr = result.load_address();
                 if addr != lldb::INVALID_ADDRESS {
                     let size = args.bytes.unwrap_or(result.byte_size() as i64) as usize;
-                    if self.is_valid_watchpoint_size(size) {
-                        let data_id = format!("{}/{}", addr, size);
-                        let desc = result.name().unwrap_or(expr);
-                        Ok(DataBreakpointInfoResponseBody {
-                            data_id: Some(data_id),
-                            access_types: Some(vec![
-                                DataBreakpointAccessType::Read,
-                                DataBreakpointAccessType::Write,
-                                DataBreakpointAccessType::ReadWrite,
-                            ]),
-                            description: format!("{} bytes at {:X} ({})", size, addr, desc),
-                            ..Default::default()
-                        })
-                    } else {
-                        Ok(DataBreakpointInfoResponseBody {
-                            data_id: None,
-                            description: format!("Expression '{}' results in invalid watchpoint size: {}.", expr, size),
-                            ..Default::default()
-                        })
-                    }
+                    let data_id = format!("{}/{}", addr, size);
+                    let desc = result.name().unwrap_or(expr);
+                    Ok(DataBreakpointInfoResponseBody {
+                        data_id: Some(data_id),
+                        access_types: Some(vec![
+                            DataBreakpointAccessType::Read,
+                            DataBreakpointAccessType::Write,
+                            DataBreakpointAccessType::ReadWrite,
+                        ]),
+                        description: format!("{} bytes at {:X} ({})", size, addr, desc),
+                        ..Default::default()
+                    })
                 } else {
                     Ok(DataBreakpointInfoResponseBody {
                         data_id: None,
@@ -1192,18 +1170,52 @@ impl DebugSession {
                 (true, true) => "read and write",
                 _ => unreachable!(),
             };
-            let res = match self.target.watch_address(addr, size, read, write) {
-                Ok(_wp) => Breakpoint {
-                    verified: true,
-                    message: Some(format!("Break on {}", when)),
-                    ..Default::default()
-                },
-                Err(err) => Breakpoint {
-                    verified: false,
-                    message: Some(err.to_string()),
-                    ..Default::default()
-                },
+
+            // In LLDB, if you ask for a watchpoint on a variable (watch
+            // set variable foo), and foo's size > the hardware watchpoint size
+            // (e.g. 8 bytes), it actually creates N watchpoints, each of size 8
+            // bytes, to cover the entire size of 'foo'. We don't implement that
+            // here, rather requiring the user to manually add watchpoints to
+            // each word.  So we do the same.
+            let (required_watchpoints, wp_size) = if self.is_valid_watchpoint_size(size) {
+                (1, size)
+            } else {
+                ((size + self.target.address_byte_size() - 1) / self.target.address_byte_size(),
+                self.target.address_byte_size())
             };
+
+            let mut res = Breakpoint {
+                verified: true,
+                message: Some(format!("{} watchpoints on {} to {} bytes at {}", required_watchpoints, when, size, addr)),
+                ..Default::default()
+            };
+
+            let mut wps = vec![];
+            for i in 0..required_watchpoints {
+                let offset = (self.target.address_byte_size() * i as usize) as u64;
+                match self.target.watch_address(addr + offset, wp_size, read, write) {
+                    Ok(wp) => wps.push(wp),
+                    Err(err) => {
+                        res = Breakpoint {
+                            verified: false,
+                            message: Some(err.to_string()),
+                            ..Default::default()
+                        };
+                        break;
+                    }
+                };
+            }
+
+            // Undo on partial failure
+            // If we need to create N watchpoints, then we should do so
+            // atomically, i.e. if any of them fail, we should remove the ones
+            // that succeeded
+            if !res.verified {
+                for wp in wps {
+                    self.target.delete_watchpoint(wp.id());
+                }
+            }
+
             watchpoints.push(res);
         }
         Ok(SetDataBreakpointsResponseBody {
